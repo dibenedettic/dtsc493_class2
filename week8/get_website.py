@@ -5,6 +5,9 @@ from typing import List
 from googlesearch import search
 import requests
 import re
+import numpy as np
+
+from tenacity import retry_unless_exception_type
 
 
 def scrape_website(path: str):
@@ -57,7 +60,7 @@ def generic_phrase_counter(txt: List[str], word: str):
 
     Return: a count of a search word or phrase
     """
-    return sum([phrase.count(word) for phrase in txt])
+    return sum([len(re.findall(r'\b%s\b' % word, phrase)) for phrase in txt])
 
 def extract_all_features(url: str):
     """extract all features from a website regarding treatment of AAPI subgroups in diversity statements
@@ -128,7 +131,8 @@ def extract_all_features(url: str):
         'count_taiwan': generic_phrase_counter(scraped, "taiwan"),
         'count_hong_kong': generic_phrase_counter(scraped, "hong kong"),
         'count_macao': generic_phrase_counter(scraped, "macao"),
-        'zip': get_zipcode(full_scraped)
+        'zip': get_zipcode(full_scraped),
+        'url': url
     }
     return out
 
@@ -140,7 +144,7 @@ def get_zipcode(txt: List[str]):
         search = re.search(search_string, ' ' + text_element + ' ')
         if search is not None:
             zip_codes.append(search.group(0))
-    return zip_codes[0] if len(zip_codes) > 0 else None
+    return zip_codes[0][1:-1] if len(zip_codes) > 0 else None
 
 def loop_through_universities(path:str):
     """_summary_
@@ -153,7 +157,7 @@ def loop_through_universities(path:str):
 
     feature_list = []
 
-    for university in universities['university']:
+    for university in universities['University']:
         try:
             query = university.lower() + default_query
             results = search(query, num=5, stop=5, pause=2)
@@ -161,16 +165,113 @@ def loop_through_universities(path:str):
                 feautures = extract_all_features(result)
                 feautures['search_index'] = i
                 feautures['university'] = university
-                feautures['url'] = query
+                feautures['query'] = query 
                 feature_list.append(feautures)
             print(university)    
         except:
             pass
     return pd.DataFrame(feature_list)
 
+#How buried are the diversity statements
+#what is the distribution mentions of specific groups ('asian' and subgroups)
+#merging in data: merge together counts that are scraped, zip codes and zctas, aggregate by metro area, merge with scraped data
+
+demo_col_names = { #subsetting column names in demo_df
+    'NAME': 'zcta',
+    'DP05_0001E' : 'pop_total',
+    'DP05_0044PE' : 'percent_asian',
+    'DP05_0045PE': 'percent_indian',
+    'DP05_0046PE': 'percent_chinese',
+    'DP05_0047PE' : 'percent_filipino',
+    'DP05_0048PE' : 'percent_japanese',
+    'DP05_0049PE': 'percent_korean',
+    'DP05_0050PE': 'percent_vietnamese',
+    'DP05_0051PE' : 'percent_other_asian',
+    'DP05_0052PE': 'percent_nhpi',
+    'DP05_0053PE': 'percent_nh',
+    'DP05_0067PE': 'percent_twoplus_asian'
+}
+
+#re run this to get new combined.csv
+
+
+zip_col_names = {
+    'ZIP_CODE': 'zip',
+    'PO_NAME': 'municipality',
+    'STATE': 'state',
+    'ZCTA': 'zcta'
+}
+
+def demographic_by_zip(zip_path: str, demo_path: str):
+    """Load in zip code and demographic area data for merging
+
+    Args:
+        zip_path (str): _description_
+        demo_path (str): _description_
+    """
+    zip_df = pd.read_csv(zip_path)
+    zip_df = zip_df[[column for column in zip_col_names]].rename(columns=zip_col_names)
+    demo_df = pd.read_csv(demo_path, skiprows=range(1,2))
+    demo_df = demo_df[[column for column in demo_col_names]].rename(columns=demo_col_names)
+    demo_df['zcta'] = demo_df['zcta'].str[5:].astype(int) #keeps zcta code without 'zcta5'
+    
+    zip_df = zip_df.loc[zip_df['zcta'] !='No ZCTA', :] # ', :' explicit about the rows and columns we want
+    zip_df['zcta'] = zip_df['zcta'].astype(int)
+    
+    demo_df = demo_df.loc[demo_df['pop_total']!=0, :].astype(float)
+    demo_df['zcta'] = demo_df['zcta'].astype(int)
+
+    comb = zip_df.merge(demo_df, on='zcta', how='left')
+
+
+    #agg to municipality level
+
+    working_cols = ['pop_total', 'municipality', 'state'] + [column for column in demo_col_names.values() if column[:3] == 'per']
+
+    for column in demo_col_names.values():
+        if column[:3] == 'per':
+            comb[column] = comb[column]*comb['pop_total']/100
+    
+    aggregated = comb[working_cols].groupby(['municipality', 'state']).transform('sum')
+    
+    for column in aggregated:
+        if column[:3] == 'per':
+            aggregated[column] = aggregated[column]/aggregated['pop_total']*100 #I think this was the error?
+    
+
+    comb = comb[['zcta', 'zip']].join(aggregated) #double brackets will produce a data frame and not a series
+    # join() vs. merge(): merging on index not on columns
+
+    return comb
+
+
+def merge_dfs(demo_cross_df: pd.DataFrame, uni_df: pd.DataFrame):
+    """Merging university dataframe with demographic dataframe
+
+     Args:
+         demo_df (pd.DataFrame): demographic dataframe
+         uni_df (pd.DataFrame): university dataframe
+    """
+    def fill_nan_zip(sr):
+        if sr.notna().sum()>0:
+            return sr.loc[sr.first_valid_index()]
+        else:
+            return np.nan
+    #groupby(search query).transform
+    #goes outside
+    uni_df['zip'] = uni_df[['university', 'zip']].groupby('university').transform(fill_nan_zip)['zip'].dropna().astype(int)
+    comb2 = uni_df.merge(demo_cross_df, on='zip', how='left')
+    #comb2['zip'] = comb2['zip'].dropna(subset = ['zip'])
+    #comb2['zip'] = comb2['zip'].replace('', np.nan)
+    comb2 = comb2.dropna(subset=['zip'])
+    return comb2
+
 
 if __name__ == "__main__":
-    df = loop_through_universities('data//university_list.csv')
-    df.to_csv('data//web_scraped_uni.csv')
-
-    
+    #df = loop_through_universities('data//good_university_list.csv')
+    #df.to_csv('data//web_scraped_uni.csv')
+    demo_cross_df = demographic_by_zip('data//zipzcta_crosswalk.csv', 'data//demo.csv')
+    uni_df = pd.read_csv('data//web_scraped_uni.csv')
+    comb = merge_dfs(demo_cross_df, uni_df)
+    comb.to_csv('data//combined.csv')
+#run new university csv
